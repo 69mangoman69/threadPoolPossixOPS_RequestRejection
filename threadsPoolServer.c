@@ -14,9 +14,10 @@ typedef struct ClientRequest_ ClientRequest;
 
 typedef struct ThreadArgs_ {
 	int threadNum;
-	sem_t* newRequestSem;
+	int* freeThreadCounter;
 	pthread_mutex_t* clientQueueMutex;
-	MyList* clientQueue;
+	pthread_mutex_t* freeThreadCounterMutex;
+	ClientRequest* clientQueue;
 } ThreadArgs;
 
 struct ClientRequest_ {
@@ -85,10 +86,11 @@ int main(int argc, char** argv) {
 	// listen for up to 1 connection
 	listen_(serverSocket, BACKLOG);
 
-	// queue setup
-	MyList* clientQueue = newMyList();
-	sem_t newRequestSem = sem_make(0);
+	//thread controll
 	pthread_mutex_t clientQueueMutex = pthread_mutex_make();
+	pthread_mutex_t freeThreadCounterMutex = pthread_mutex_make();
+	ClientRequest* request;
+	int freeThreadCounter = 0;
 
 	// thread setup
 	pthread_t* threads = malloc_(THREAD_COUNT * sizeof(pthread_t));
@@ -97,11 +99,14 @@ int main(int argc, char** argv) {
 	for (int i = 0; i < THREAD_COUNT; ++i) {
 		ThreadArgs args = {
 			.threadNum = i + 1,
-			.newRequestSem = &newRequestSem,
-			.clientQueue = clientQueue,
-			.clientQueueMutex = &clientQueueMutex
+			.freeThreadCounter = &freeThreadCounter,
+			.clientQueue = &request,
+			.clientQueueMutex = &clientQueueMutex,
+			.freeThreadCounterMutex = &freeThreadCounterMutex
 		};
-
+		pthread_mutex_lock_(&freeThreadCounterMutex);
+		freeThreadCounter++;
+		pthread_mutex_unlock_(&freeThreadCounterMutex);
 		threadArgs[i] = args;
 		pthread_create_(&threads[i], &threadAttr, &threadFunc, &threadArgs[i]);
 	}
@@ -117,26 +122,34 @@ int main(int argc, char** argv) {
 		if (errno == EINTR) {
 			break;
 		}
-		printf_("Accepted %s\n", inet_ntoa(clientAddr.sin_addr));
+		pthread_mutex_lock_(&freeThreadCounterMutex);
+		if(freeThreadCounter>0){
+			pthread_mutex_unlock_(&freeThreadCounterMutex);
+			printf_("Accepted %s\n", inet_ntoa(clientAddr.sin_addr));
 
-		// setup new struct for this client's request
-		ClientRequest* newClientRequest = (ClientRequest*) calloc(1, sizeof(ClientRequest));
-		newClientRequest->clientSocket = clientSocket;
+			// setup new struct for this client's request
+			ClientRequest* newClientRequest = (ClientRequest*) calloc(1, sizeof(ClientRequest));
+			newClientRequest->clientSocket = clientSocket;
 
-		// receive client's request message which has their redundant client adress????????
-		char requestString[LEN * 2] = {0};
-		recv_(clientSocket, requestString, 2 * LEN, 0);
+			// receive client's request message which has their redundant client adress????????
+			char requestString[LEN * 2] = {0};
+			recv_(clientSocket, requestString, 2 * LEN, 0);
 
-		// TODO: remove redundant address, pass sockaddr* to thread in request struct
-		strncpy(newClientRequest->clientAddr, requestString, LEN - 1);
-		strncpy(newClientRequest->fileName, requestString + LEN, LEN - 1);
-		printf_("Request: \"%s\"\n", newClientRequest->fileName);
+			// TODO: remove redundant address, pass sockaddr* to thread in request struct
+			strncpy(newClientRequest->clientAddr, requestString, LEN - 1);
+			strncpy(newClientRequest->fileName, requestString + LEN, LEN - 1);
+			printf_("Request: \"%s\"\n", newClientRequest->fileName);
 
-		// insert the request and signal the threads
-		pthread_mutex_lock_(&clientQueueMutex);
-		insertValLast(clientQueue, newClientRequest);
-		pthread_mutex_unlock_(&clientQueueMutex);
-		sem_post_(&newRequestSem);
+			// insert the request and signal the threads
+			pthread_mutex_lock_(&clientQueueMutex);
+			request = newClientRequest;
+			pthread_mutex_unlock_(&clientQueueMutex);
+
+			sem_post_(&newRequestSem);
+		}
+		else{
+			pthread_mutex_unlock_(&freeThreadCounterMutex);
+		}
 	}
 
 	// cancel threads and wait for them to finish
