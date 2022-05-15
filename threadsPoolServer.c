@@ -17,7 +17,8 @@ typedef struct ThreadArgs_ {
 	int* freeThreadCounter;
 	pthread_mutex_t* clientQueueMutex;
 	pthread_mutex_t* freeThreadCounterMutex;
-	ClientRequest* clientQueue;
+	MyList* clientQueue;
+	sem_t* newRequestSem;
 } ThreadArgs;
 
 struct ClientRequest_ {
@@ -40,13 +41,17 @@ void* threadFunc(void* voidArgs) {
 		// wait until we're signaled for a new request
 		sem_wait_(args->newRequestSem);
 
+		pthread_mutex_lock_(args->freeThreadCounterMutex);
+		(*(args->freeThreadCounter))--;
+		pthread_mutex_unlock_(args->freeThreadCounterMutex);
+
 		// get the request
 		pthread_mutex_lock_(args->clientQueueMutex);
 		ClientRequest* clientRequest = popFirstVal(args->clientQueue);
 		pthread_mutex_unlock_(args->clientQueueMutex);
 		printf_("Thread %d handling request: \"%s\" from %s\n",
 				args->threadNum, clientRequest->fileName, clientRequest->clientAddr);
-
+		sleep(3);
 		// open the requested file
 		int filedes = open_(clientRequest->fileName, O_RDONLY);
 		// TODO: handle ENOENT here lol
@@ -59,6 +64,10 @@ void* threadFunc(void* voidArgs) {
 		// cleanup
 		close_(clientRequest->clientSocket);
 		FREE(clientRequest);
+
+		pthread_mutex_lock_(args->freeThreadCounterMutex);
+		(*(args->freeThreadCounter))++;
+		pthread_mutex_unlock_(args->freeThreadCounterMutex);
 	}
 
 	return NULL;
@@ -87,9 +96,10 @@ int main(int argc, char** argv) {
 	listen_(serverSocket, BACKLOG);
 
 	//thread controll
+	sem_t newRequestSem = sem_make(0);
 	pthread_mutex_t clientQueueMutex = pthread_mutex_make();
 	pthread_mutex_t freeThreadCounterMutex = pthread_mutex_make();
-	ClientRequest* request;
+	MyList* clientQueue = newMyList();
 	int freeThreadCounter = 0;
 
 	// thread setup
@@ -100,9 +110,10 @@ int main(int argc, char** argv) {
 		ThreadArgs args = {
 			.threadNum = i + 1,
 			.freeThreadCounter = &freeThreadCounter,
-			.clientQueue = &request,
+			.clientQueue = clientQueue,
 			.clientQueueMutex = &clientQueueMutex,
-			.freeThreadCounterMutex = &freeThreadCounterMutex
+			.freeThreadCounterMutex = &freeThreadCounterMutex,
+			.newRequestSem = &newRequestSem
 		};
 		pthread_mutex_lock_(&freeThreadCounterMutex);
 		freeThreadCounter++;
@@ -142,13 +153,20 @@ int main(int argc, char** argv) {
 
 			// insert the request and signal the threads
 			pthread_mutex_lock_(&clientQueueMutex);
-			request = newClientRequest;
+			insertValLast(clientQueue, newClientRequest);
 			pthread_mutex_unlock_(&clientQueueMutex);
 
 			sem_post_(&newRequestSem);
 		}
 		else{
 			pthread_mutex_unlock_(&freeThreadCounterMutex);
+			printf_("Rejected %s\n", inet_ntoa(clientAddr.sin_addr));
+
+			char buf[MAX_BUF + 1] = {0};
+			sprintf(buf, "Rejected: No free threads");
+			send_(clientSocket, buf, strlen(buf), 0);
+
+			close_(clientSocket);
 		}
 	}
 
