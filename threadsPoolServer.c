@@ -1,77 +1,4 @@
-#define ERR_MULTIPROCESS 0
-#define USAGE_STRING "serverAddress"
-
-typedef struct ClientRequest_ ClientRequest;
-#define LIST_TYPE ClientRequest*
-#include "katwikOpsys.h"
-
-#define PORT 3500
-#define BACKLOG 1
-
-#define MAX_BUF 500
-#define LEN 40
-#define THREAD_COUNT 2
-
-typedef struct ThreadArgs_ {
-	int threadNum;
-	int* freeThreadCounter;
-	pthread_mutex_t* clientQueueMutex;
-	pthread_mutex_t* freeThreadCounterMutex;
-	MyList* clientQueue;
-	sem_t* newRequestSem;
-} ThreadArgs;
-
-struct ClientRequest_ {
-	char clientAddr[LEN];
-	char fileName[LEN];
-	int clientSocket;
-};
-
-volatile sig_atomic_t sigint_received = 0;
-void sigint_handler(int sig) {
-	UNUSED(sig);
-	sigint_received = 1;
-}
-
-void* threadFunc(void* voidArgs) {
-	pthread_setcanceltype_(PTHREAD_CANCEL_DEFERRED, NULL);
-	ThreadArgs* args = (ThreadArgs*) voidArgs;
-
-	while (!sigint_received) {
-		// wait until we're signaled for a new request
-		sem_wait_(args->newRequestSem);
-
-		pthread_mutex_lock_(args->freeThreadCounterMutex);
-		(*(args->freeThreadCounter))--;
-		pthread_mutex_unlock_(args->freeThreadCounterMutex);
-
-		// get the request
-		pthread_mutex_lock_(args->clientQueueMutex);
-		ClientRequest* clientRequest = popFirstVal(args->clientQueue);
-		pthread_mutex_unlock_(args->clientQueueMutex);
-		printf_("Thread %d handling request: \"%s\" from %s\n",
-				args->threadNum, clientRequest->fileName, clientRequest->clientAddr);
-		sleep(3);
-		// open the requested file
-		int filedes = open_(clientRequest->fileName, O_RDONLY);
-		// TODO: handle ENOENT here lol
-
-		// read the file and send it
-		char buf[MAX_BUF + 1] = {0};
-		read_(filedes, buf, MAX_BUF);
-		send_(clientRequest->clientSocket, buf, strlen(buf), 0);
-
-		// cleanup
-		close_(clientRequest->clientSocket);
-		FREE(clientRequest);
-
-		pthread_mutex_lock_(args->freeThreadCounterMutex);
-		(*(args->freeThreadCounter))++;
-		pthread_mutex_unlock_(args->freeThreadCounterMutex);
-	}
-
-	return NULL;
-}
+#include "threadfunc.h"
 
 int main(int argc, char** argv) {
 	USAGE(argc == 2);
@@ -99,8 +26,10 @@ int main(int argc, char** argv) {
 	sem_t newRequestSem = sem_make(0);
 	pthread_mutex_t clientQueueMutex = pthread_mutex_make();
 	pthread_mutex_t freeThreadCounterMutex = pthread_mutex_make();
-	MyList* clientQueue = newMyList();
+	//MyList* clientQueue = newMyList();
+	ClientRequest clientQueue = {0};
 	int freeThreadCounter = 0;
+	pthread_barrier_t sharedAddrBarier = pthread_barrier_make(2);
 
 	// thread setup
 	pthread_t* threads = malloc_(THREAD_COUNT * sizeof(pthread_t));
@@ -110,10 +39,11 @@ int main(int argc, char** argv) {
 		ThreadArgs args = {
 			.threadNum = i + 1,
 			.freeThreadCounter = &freeThreadCounter,
-			.clientQueue = clientQueue,
+			.clientQueue = &clientQueue,
 			.clientQueueMutex = &clientQueueMutex,
 			.freeThreadCounterMutex = &freeThreadCounterMutex,
-			.newRequestSem = &newRequestSem
+			.newRequestSem = &newRequestSem,
+			.sharedAddrBarier = &sharedAddrBarier
 		};
 		pthread_mutex_lock_(&freeThreadCounterMutex);
 		freeThreadCounter++;
@@ -138,25 +68,23 @@ int main(int argc, char** argv) {
 			pthread_mutex_unlock_(&freeThreadCounterMutex);
 			printf_("Accepted %s\n", inet_ntoa(clientAddr.sin_addr));
 
-			// setup new struct for this client's request
-			ClientRequest* newClientRequest = (ClientRequest*) calloc(1, sizeof(ClientRequest));
-			newClientRequest->clientSocket = clientSocket;
+			
 
 			// receive client's request message which has their redundant client adress????????
 			char requestString[LEN * 2] = {0};
 			recv_(clientSocket, requestString, 2 * LEN, 0);
 
-			// TODO: remove redundant address, pass sockaddr* to thread in request struct
-			strncpy(newClientRequest->clientAddr, requestString, LEN - 1);
-			strncpy(newClientRequest->fileName, requestString + LEN, LEN - 1);
-			printf_("Request: \"%s\"\n", newClientRequest->fileName);
-
-			// insert the request and signal the threads
 			pthread_mutex_lock_(&clientQueueMutex);
-			insertValLast(clientQueue, newClientRequest);
+			clientQueue.clientSocket = clientSocket;
+			// TODO: remove redundant address, pass sockaddr* to thread in request struct
+			strncpy(clientQueue.clientAddr, requestString, LEN - 1);
+			strncpy(clientQueue.fileName, requestString + LEN, LEN - 1);
 			pthread_mutex_unlock_(&clientQueueMutex);
 
+			printf_("Request: \"%s\"\n", clientQueue.fileName);
+
 			sem_post_(&newRequestSem);
+			pthread_barrier_wait_(&sharedAddrBarier);
 		}
 		else{
 			pthread_mutex_unlock_(&freeThreadCounterMutex);
@@ -179,14 +107,7 @@ int main(int argc, char** argv) {
 	// cleanup and exit
 	printf_("\n"); // slightly tidier exit
 
-	// free any remaining requests in queue
-	// fixes Issue #3 lul
-	for (ClientRequest* clientRequest; myListLength(clientQueue);) {
-		clientRequest = popFirstVal(clientQueue);
-		FREE(clientRequest);
-	}
-	deleteMyList(clientQueue); 
-
+	pthread_barrier_destroy_(&sharedAddrBarier);
 	sem_destroy_(&newRequestSem);
 	pthread_mutex_destroy_(&clientQueueMutex);
 	close_(serverSocket);
