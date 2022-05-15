@@ -23,7 +23,7 @@ int main(int argc, char** argv) {
 	// setup our socket, we'll also use this to connect
 	int clientSock = socket_(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 
-	// make the server socket reusable and non-blocking
+	// make the client socket reusable
 	int reuse = 1;
 	setsockopt_(clientSock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(int));
 

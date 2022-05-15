@@ -14,11 +14,13 @@ typedef struct ClientRequest_ ClientRequest;
 
 typedef struct ThreadArgs_ {
 	int threadNum;
-	int* freeThreadCounter;
-	pthread_mutex_t* clientQueueMutex;
-	pthread_mutex_t* freeThreadCounterMutex;
+
 	MyList* clientQueue;
+	pthread_mutex_t* clientQueueMutex;
 	sem_t* newRequestSem;
+
+	int* freeThreadCounter;
+	pthread_mutex_t* freeThreadCounterMutex;
 } ThreadArgs;
 
 struct ClientRequest_ {
@@ -42,11 +44,10 @@ void* threadFunc(void* voidArgs) {
 		// wait until we're signaled for a new request
 		sem_wait_(args->newRequestSem);
 
+		// decrement the number of free threads, since we aren't any more
 		pthread_mutex_lock_(args->freeThreadCounterMutex);
-		(*(args->freeThreadCounter))--;
+		--*args->freeThreadCounter;
 		pthread_mutex_unlock_(args->freeThreadCounterMutex);
-
-		sleep(3);
 
 		// get the request
 		pthread_mutex_lock_(args->clientQueueMutex);
@@ -66,10 +67,18 @@ void* threadFunc(void* voidArgs) {
 		if (ENOENT == errno) {
 			send_(clientRequest->clientSocket,
 					BAD_FILE_RESPONSE, strlen(BAD_FILE_RESPONSE), 0);
+
+			// TODO: this cleanup should probably be moved to a pthread_cleanup_pop tbh
+			// because 1) cancel points
+			// 2) no point of repeated this code right below lol
 			close_(clientRequest->clientSocket);
 
 			FREE(clientRequest->clientAddr);
 			FREE(clientRequest);
+
+			pthread_mutex_lock_(args->freeThreadCounterMutex);
+			++*args->freeThreadCounter;
+			pthread_mutex_unlock_(args->freeThreadCounterMutex);
 			continue;
 		}
 
@@ -83,8 +92,9 @@ void* threadFunc(void* voidArgs) {
 		FREE(clientRequest->clientAddr);
 		FREE(clientRequest);
 
+		// increment the number of free threads, since we are now
 		pthread_mutex_lock_(args->freeThreadCounterMutex);
-		(*(args->freeThreadCounter))++;
+		++*args->freeThreadCounter;
 		pthread_mutex_unlock_(args->freeThreadCounterMutex);
 	}
 
@@ -103,7 +113,7 @@ int main(int argc, char** argv) {
 	// setup our socket
 	int serverSocket = socket_(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 
-	// make the server socket reusable and non-blocking
+	// make the server socket reusable
 	int reuse = 1;
 	setsockopt_(serverSocket, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(int));
 
@@ -113,12 +123,15 @@ int main(int argc, char** argv) {
 	// listen for up to 1 connection
 	listen_(serverSocket, BACKLOG);
 
-	//thread controll
-	sem_t newRequestSem = sem_make(0);
-	pthread_mutex_t clientQueueMutex = pthread_mutex_make();
-	pthread_mutex_t freeThreadCounterMutex = pthread_mutex_make();
+	// for queueing clients and signaling threads that there's a new client
 	MyList* clientQueue = newMyList();
+	pthread_mutex_t clientQueueMutex = pthread_mutex_make();
+	sem_t newRequestSem = sem_make(0);
+
+	// we'll count how many threads are free,
+	// reject clients if there aren't any
 	int freeThreadCounter = 0;
+	pthread_mutex_t freeThreadCounterMutex = pthread_mutex_make();
 
 	// thread setup
 	pthread_t* threads = malloc_(THREAD_COUNT * sizeof(pthread_t));
@@ -134,12 +147,9 @@ int main(int argc, char** argv) {
 			.newRequestSem = &newRequestSem
 		};
 
-		// TODO: remove these locks
-		pthread_mutex_lock_(&freeThreadCounterMutex);
-		freeThreadCounter++;
-		pthread_mutex_unlock_(&freeThreadCounterMutex);
 		threadArgs[i] = args;
 		pthread_create_(&threads[i], &threadAttr, &threadFunc, &threadArgs[i]);
+		++freeThreadCounter;
 	}
 
 	// queue requests until we're interrupted
@@ -159,24 +169,18 @@ int main(int argc, char** argv) {
 			break;
 		}
 
-//<<<<<<< HEAD
 		pthread_mutex_lock_(&freeThreadCounterMutex);
 		// if we're accepting the client
 		if (freeThreadCounter > 0) {
-			printf_("%d\n", freeThreadCounter);
 			pthread_mutex_unlock_(&freeThreadCounterMutex);
 
 			// setup new struct for this client's request
-			ClientRequest* newClientRequest = (ClientRequest*) calloc(1, sizeof(ClientRequest));
+			ClientRequest* newClientRequest
+				= (ClientRequest*) calloc(1, sizeof(ClientRequest));
 			newClientRequest->clientSocket = clientSocket;
 			newClientRequest->clientAddr = clientAddr;
 
-			//char requestString[MAX_REQUEST_LEN * 2] = {0};
 			recv_(clientSocket, newClientRequest->fileName, MAX_REQUEST_LEN, 0);
-
-			// TODO: remove redundant address, pass sockaddr* to thread in request struct
-			//strncpy(newClientRequest->clientAddr, requestString, LEN - 1);
-			//strncpy(newClientRequest->fileName, requestString + LEN, LEN - 1);
 
 			// print request details
 			printf_("Main thread accepted request: \"%s\" from %s\n",
@@ -190,38 +194,16 @@ int main(int argc, char** argv) {
 			sem_post_(&newRequestSem);
 		}
 
-//=======
-#if TEMP_REMOVE
-		// struct for new client's request
-		ClientRequest* newClientRequest = (ClientRequest*) calloc(1, sizeof(ClientRequest));
-		newClientRequest->clientSocket = clientSocket;
-		newClientRequest->clientAddr = clientAddr;
-
-		// receive client's request and put it in the struct
-		recv_(clientSocket, newClientRequest->fileName, MAX_REQUEST_LEN, 0);
-
-		// print request details
-		printf_("Main thread accepted request: \"%s\" from %s\n",
-				newClientRequest->fileName, inet_ntoa(clientAddr->sin_addr));
-
-		// insert the request and signal the threads
-		pthread_mutex_lock_(&clientQueueMutex);
-		insertValLast(clientQueue, newClientRequest);
-		pthread_mutex_unlock_(&clientQueueMutex);
-
-		sem_post_(&newRequestSem);
-#endif // TEMP_REMOVE
-//>>>>>>> 64e06c54ecf9f59bfee79019819d6dd94dcc9954
-
 		// if we're rejecting the client
 		else {
 			pthread_mutex_unlock_(&freeThreadCounterMutex);
 
-			printf_("Rejected %s\n", inet_ntoa(clientAddr->sin_addr));
-
 			char buf[MAX_REQUEST_LEN + 1] = {0};
 			sprintf(buf, "Rejected: No free threads");
 			send_(clientSocket, buf, strlen(buf), 0);
+
+			printf_("Main thread rejected request from %s\n",
+					inet_ntoa(clientAddr->sin_addr));
 
 			close_(clientSocket);
 			FREE(clientAddr);
