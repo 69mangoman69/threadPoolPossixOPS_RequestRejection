@@ -6,11 +6,11 @@ typedef struct ClientRequest_ ClientRequest;
 #include "katwikOpsys.h"
 
 #define PORT 3500
-#define BACKLOG 1
 
 #define MAX_FILE_LEN 500
 #define MAX_REQUEST_LEN 40
-#define THREAD_COUNT 1
+#define THREAD_COUNT 2
+#define BACKLOG THREAD_COUNT
 
 typedef struct ThreadArgs_ {
 	int threadNum;
